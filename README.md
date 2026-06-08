@@ -4,7 +4,7 @@
 
 # Origin Recon
 
-**Maker:** [XecureLogic](https://xecurelogic.com) — xecurelogic.com
+**Built by:** [XecureLogic](https://xecurelogic.com) — xecurelogic.com
 
 A self-contained, locally-run DNS / origin / attacker-infrastructure recon tool.
 Give it a domain and it does in one pass what normally takes a dozen browser tabs:
