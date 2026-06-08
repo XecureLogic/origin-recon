@@ -1,0 +1,32 @@
+{
+  "name": "origin-recon-frontend",
+  "description": "Origin Recon \u2014 passive DNS & origin-infrastructure recon.",
+  "author": "XecureLogic (https://xecurelogic.com)",
+  "homepage": "https://xecurelogic.com",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "lucide-react": "^0.454.0",
+    "d3-geo": "^3.1.1",
+    "topojson-client": "^3.1.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "vite": "^5.4.11",
+    "typescript": "^5.6.3",
+    "tailwindcss": "^3.4.17",
+    "postcss": "^8.4.49",
+    "autoprefixer": "^10.4.20",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@types/d3-geo": "^3.1.0",
+    "@types/topojson-client": "^3.1.5"
+  }
+}
