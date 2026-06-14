@@ -63,12 +63,37 @@ For a target domain it performs **passive** OSINT recon and renders:
 All sources are read-only/passive by default. The engine fails safe per source (a down
 or keyless source degrades that section with a note; it never fabricates data).
 
+## Prerequisites
+
+`run.sh` needs three things on your PATH: **Python 3** (with the `venv` module),
+**Node.js**, and **npm**. Python ships with most Linux distros, but on Debian/Kali/Ubuntu
+the `venv` module and Node are separate packages:
+
+```bash
+sudo apt update
+sudo apt install -y python3-venv nodejs npm
+```
+
+> On Kali, `python3 -m venv` requires the `python3-venv` package that matches your
+> interpreter (e.g. `python3.13-venv`). If venv creation fails, `run.sh` tells you which
+> package to install.
+
+Verify:
+
+```bash
+python3 --version && node -v && npm -v
+```
+
 ## Quick start (one command)
 
 ```bash
 ./run.sh
 ```
 Then open http://localhost:8000
+
+If a previous run was interrupted (a missing package, Ctrl+C mid-install), just run
+`./run.sh` again — it detects a half-built backend venv, rebuilds it, and refuses to
+report success unless the backend is actually serving on port 8000.
 
 `run.sh` creates a venv, installs backend deps, builds the frontend, serves the built
 UI from the backend on port 8000, and opens your browser. `./run.sh --dev` runs the
