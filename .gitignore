@@ -1,0 +1,26 @@
+# Secrets — never commit (.env* also catches Windows' .env.txt mistake)
+.env
+.env.*
+backend/.env
+backend/.env.*
+*.key
+
+# Python
+backend/.venv/
+__pycache__/
+*.pyc
+
+# Local scan database
+backend/origin-recon.db
+*.db
+
+# Node
+frontend/node_modules/
+frontend/package-lock.json
+
+# Logs (created at runtime by run.sh / run.ps1)
+*.log
+
+# NOTE: frontend/dist/ is intentionally tracked — the backend serves the built
+# UI from it so a fresh clone runs without a build step. run.sh / run.ps1
+# rebuild it on launch, so expect dist changes to show up after a run.

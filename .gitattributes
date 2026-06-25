@@ -1,0 +1,15 @@
+# Normalize line endings in the repo to LF, and check files out per-platform.
+# Shell scripts MUST stay LF on every platform or the shebang breaks on Linux
+# (env reads "bash\r"). PowerShell scripts are happy with LF too.
+* text=auto
+
+*.sh    text eol=lf
+*.bash  text eol=lf
+*.py    text eol=lf
+*.ps1   text eol=lf
+
+# Binary assets — never touch.
+*.png   binary
+*.jpg   binary
+*.ico   binary
+*.json  text

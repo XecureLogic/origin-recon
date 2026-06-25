@@ -27,6 +27,9 @@ require npm     "sudo apt install npm"
 
 PIDS=()
 cleanup() {
+  # Disarm the traps so this runs once, and preserve the script's exit code
+  # (so a build/health failure still surfaces as non-zero instead of exit 0).
+  trap - INT TERM EXIT
   echo
   echo "Stopping Origin Recon..."
   for pid in "${PIDS[@]:-}"; do
@@ -34,9 +37,10 @@ cleanup() {
     kill "$pid" 2>/dev/null || true
   done
   wait 2>/dev/null || true
-  exit 0
 }
-trap cleanup INT TERM
+# EXIT too: if the frontend build (or anything) fails under `set -e`, we still
+# tear down the already-started backend instead of orphaning it on port 8000.
+trap cleanup INT TERM EXIT
 
 open_browser() {
   local url="$1"
@@ -119,7 +123,13 @@ if [[ "$MODE" == "dev" ]]; then
   echo "  Logs:    backend.log / frontend.log     (Ctrl+C stops both)"
 else
   echo "[frontend] building UI..."
-  npm run build >"$ROOT/frontend-build.log" 2>&1
+  if ! npm run build >"$ROOT/frontend-build.log" 2>&1; then
+    echo "error: frontend build failed. last lines of frontend-build.log:" >&2
+    tail -n 25 "$ROOT/frontend-build.log" >&2 || true
+    echo "       (a common cause: node_modules copied from another OS — run:" >&2
+    echo "        rm -rf frontend/node_modules && cd frontend && npm install)" >&2
+    exit 1
+  fi
   open_browser "http://localhost:${BACKEND_PORT}"
   echo
   echo "Origin Recon is running -> http://localhost:${BACKEND_PORT}"

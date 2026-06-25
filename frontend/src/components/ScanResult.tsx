@@ -4,6 +4,7 @@ import { GraphView } from "./GraphView";
 import { SystemLocations } from "./SystemLocations";
 import { RecordsTable } from "./RecordsTable";
 import { Verdict } from "./Verdict";
+import { WhoisPanel } from "./WhoisPanel";
 
 type ScanResultProps = {
   scan: ScanDetail;
@@ -51,6 +52,8 @@ export const ScanResult: React.FC<ScanResultProps> = ({ scan, onExportIocs, onEx
       </div>
 
       <Verdict scan={scan} />
+
+      <WhoisPanel scan={scan} />
 
       <div className="rounded-2xl border border-slate-800 bg-slate-900/60 p-4 md:p-5">
         <div className="flex items-center justify-between mb-3">

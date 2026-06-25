@@ -19,12 +19,26 @@ export type IPInfo = {
   country?: string | null; country_code?: string | null; org?: string | null;
   network?: string | null; services?: string | null; lat?: number | null; lng?: number | null;
   is_cdn?: boolean; high_risk?: boolean; reputation?: string | null; source?: string | null;
+  registry?: string | null; network_name?: string | null; network_range?: string | null;
+  abuse_email?: string | null; allocation_date?: string | null;
+};
+export type DomainWhois = {
+  domain_name?: string | null; registry_domain_id?: string | null;
+  registrar_whois_server?: string | null; registrar_url?: string | null;
+  updated_date?: string | null; creation_date?: string | null; expiration_date?: string | null;
+  registrar?: string | null; registrar_iana_id?: string | null;
+  registrant_organization?: string | null; registrant_street?: string | null;
+  registrant_city?: string | null; registrant_state?: string | null;
+  registrant_postal_code?: string | null; registrant_country?: string | null;
+  name_servers?: string[]; domain_status?: string[];
+  source?: "rdap" | "whois43" | null; error?: string | null;
 };
 export type ScanDetail = ScanStatus & {
   edge_masked: "yes" | "no" | "unknown";
   edge_org?: string | null;
   verdict: "malicious" | "suspicious" | "clean" | "unknown";
   verdict_reasons: string[];
+  whois?: DomainWhois | null;
   records: DnsRecord[]; subdomains: Subdomain[]; ips: IPInfo[];
   origin_candidates: IPInfo[]; notes?: string[];
 };

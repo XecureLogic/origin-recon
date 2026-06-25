@@ -129,6 +129,43 @@ class IPInfo(BaseModel):
     high_risk: bool = False                  # on Spamhaus ASN-DROP / known-abuse
     reputation: Optional[str] = None         # abuse.ch known-bad confirmation
     source: Optional[str] = None             # live | passive-dns | mx | ns
+    # --- extended RDAP registry detail ---
+    registry: Optional[str] = None           # RIR: arin | ripe | apnic | lacnic | afrinic
+    network_name: Optional[str] = None       # registered network/handle name
+    network_range: Optional[str] = None      # start - end addresses
+    abuse_email: Optional[str] = None         # network abuse contact (for takedown)
+    allocation_date: Optional[str] = None    # ASN / network allocation date
+
+
+class DomainWhois(BaseModel):
+    """Registration data for the apex domain.
+
+    Populated from registry/registrar RDAP (preferred — structured JSON) with a
+    port-43 WHOIS fallback. We query authoritative sources directly (IANA
+    bootstrap -> registry -> registrar); no third-party aggregator API is used.
+    Post-GDPR, registrant fields are usually redacted by the registry — when a
+    value comes back privacy-masked we store the marker "Redacted" rather than
+    the registry's free-text so the UI can render it consistently.
+    """
+    domain_name: Optional[str] = None
+    registry_domain_id: Optional[str] = None
+    registrar_whois_server: Optional[str] = None
+    registrar_url: Optional[str] = None
+    updated_date: Optional[str] = None
+    creation_date: Optional[str] = None
+    expiration_date: Optional[str] = None
+    registrar: Optional[str] = None
+    registrar_iana_id: Optional[str] = None
+    registrant_organization: Optional[str] = None
+    registrant_street: Optional[str] = None
+    registrant_city: Optional[str] = None
+    registrant_state: Optional[str] = None
+    registrant_postal_code: Optional[str] = None
+    registrant_country: Optional[str] = None
+    name_servers: list[str] = []
+    domain_status: list[str] = []
+    source: Optional[str] = None              # rdap | whois43
+    error: Optional[str] = None               # why lookup degraded, if it did
 
 
 class ScanDetail(BaseModel):
@@ -142,6 +179,7 @@ class ScanDetail(BaseModel):
     edge_org: Optional[str] = None
     verdict: str = "unknown"                  # malicious | suspicious | clean | unknown
     verdict_reasons: list[str] = []
+    whois: Optional[DomainWhois] = None
     records: list[Record]
     subdomains: list[Subdomain]
     ips: list[IPInfo]
@@ -422,14 +460,29 @@ def probe_services(ip: str) -> Optional[str]:
 
 def enrich_ip(ip: str, source: str, hr: set[str]) -> IPInfo:
     asn = asn_name = country = org = network = cc = None
+    registry = net_name = net_range = abuse_email = alloc_date = None
     try:
         res = IPWhois(ip).lookup_rdap(asn_methods=["whois", "dns"])
         asn = res.get("asn")
         asn_name = res.get("asn_description")
         cc = (res.get("asn_country_code") or "").upper() or None
+        registry = res.get("asn_registry") or None
+        alloc_date = res.get("asn_date") or None
         net = res.get("network") or {}
         network = net.get("cidr")
-        org = net.get("name") or asn_name
+        net_name = net.get("name")
+        org = net_name or asn_name
+        start, end = net.get("start_address"), net.get("end_address")
+        if start and end:
+            net_range = f"{start} - {end}"
+        # Abuse contact: scan RDAP objects for an entity with the 'abuse' role.
+        for obj in (res.get("objects") or {}).values():
+            roles = obj.get("roles") or []
+            if "abuse" in roles:
+                emails = (obj.get("contact") or {}).get("email") or []
+                if emails:
+                    abuse_email = emails[0].get("value") if isinstance(emails[0], dict) else str(emails[0])
+                    break
     except Exception:
         pass
 
@@ -448,7 +501,299 @@ def enrich_ip(ip: str, source: str, hr: set[str]) -> IPInfo:
         services=probe_services(ip), lat=lat, lng=lng,
         is_cdn=is_cdn(f"{asn_name} {org} {announced}"),
         high_risk=high, reputation=rep, source=source,
+        registry=(registry.upper() if registry else None),
+        network_name=net_name, network_range=net_range,
+        abuse_email=abuse_email, allocation_date=alloc_date,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Domain WHOIS — RDAP-first, port-43 fallback (no third-party aggregator)      #
+# --------------------------------------------------------------------------- #
+# Registries return privacy-masked free text post-GDPR; collapse the literal
+# "redacted" markers to one token. NOTE we deliberately do NOT mask privacy-proxy
+# org names (e.g. "Domains By Proxy, LLC", "Withheld for Privacy ehf") — those
+# are real, useful intel about who fronts the registration.
+_REDACTION_TOKENS = (
+    "redacted", "data protected", "not disclosed", "gdpr masked",
+    "statutory masking enabled", "non-public data",
+)
+
+
+def _redact_norm(value) -> Optional[str]:
+    if value is None:
+        return None
+    v = str(value).strip()
+    if not v:
+        return None
+    low = v.lower()
+    if any(tok in low for tok in _REDACTION_TOKENS):
+        return "Redacted"
+    return v
+
+
+def _flat(v) -> Optional[str]:
+    """jCard values may be a string or a nested list (e.g. multi-line street)."""
+    if v is None:
+        return None
+    if isinstance(v, list):
+        joined = ", ".join(str(x).strip() for x in v if str(x).strip())
+        return joined or None
+    s = str(v).strip()
+    return s or None
+
+
+# --- RDAP path -------------------------------------------------------------- #
+_RDAP_BOOTSTRAP: Optional[dict[str, str]] = None
+
+
+def rdap_bootstrap() -> dict[str, str]:
+    """TLD -> registry RDAP base URL, from IANA's authoritative bootstrap file."""
+    global _RDAP_BOOTSTRAP
+    if _RDAP_BOOTSTRAP is not None:
+        return _RDAP_BOOTSTRAP
+    mapping: dict[str, str] = {}
+    cache_file = CACHE_DIR / "rdap-dns.json"
+    fresh = cache_file.exists() and (time.time() - cache_file.stat().st_mtime) < 7 * 86400
+    raw = ""
+    if fresh:
+        raw = cache_file.read_text(errors="ignore")
+    else:
+        try:
+            r = SESSION.get("https://data.iana.org/rdap/dns.json", timeout=HTTP_TIMEOUT)
+            if r.ok:
+                raw = r.text
+                cache_file.write_text(raw)
+        except Exception:
+            if cache_file.exists():
+                raw = cache_file.read_text(errors="ignore")
+    try:
+        data = json.loads(raw) if raw else {}
+        for svc in data.get("services", []):
+            tlds, urls = svc[0], svc[1]
+            base = next((u for u in urls if u.startswith("https")), (urls[0] if urls else None))
+            if not base:
+                continue
+            base = base.rstrip("/")
+            for t in tlds:
+                mapping[t.lower().lstrip(".")] = base
+    except Exception:
+        pass
+    _RDAP_BOOTSTRAP = mapping
+    return mapping
+
+
+def _vcard_props(entity: dict) -> dict[str, list]:
+    """Flatten a jCard (vcardArray) into {prop_name: [(params, value), ...]}."""
+    arr = entity.get("vcardArray")
+    props: dict[str, list] = {}
+    if not (isinstance(arr, list) and len(arr) == 2 and isinstance(arr[1], list)):
+        return props
+    for item in arr[1]:
+        try:
+            name, params, value = item[0], (item[1] or {}), item[3]
+            props.setdefault(name, []).append((params, value))
+        except Exception:
+            continue
+    return props
+
+
+def _entity_by_role(entities: list, role: str) -> Optional[dict]:
+    """Find the entity holding a role, searching one level of nesting."""
+    for e in entities or []:
+        if role in (e.get("roles") or []):
+            return e
+        nested = _entity_by_role(e.get("entities") or [], role)
+        if nested:
+            return nested
+    return None
+
+
+def _rdap_parse(j: dict, domain: str) -> DomainWhois:
+    w = DomainWhois(source="rdap")
+    w.domain_name = (j.get("ldhName") or j.get("unicodeName") or domain).lower()
+    w.registry_domain_id = j.get("handle") or None
+    w.registrar_whois_server = j.get("port43") or None
+    w.domain_status = list(j.get("status") or [])
+    w.name_servers = sorted({(n.get("ldhName") or "").lower().rstrip(".") for n in (j.get("nameservers") or []) if n.get("ldhName")})
+
+    for ev in j.get("events") or []:
+        act = (ev.get("eventAction") or "").lower()
+        date = ev.get("eventDate")
+        if act == "registration":
+            w.creation_date = date
+        elif act == "last changed":
+            w.updated_date = date
+        elif act == "expiration":
+            w.expiration_date = date
+
+    entities = j.get("entities") or []
+    reg = _entity_by_role(entities, "registrar")
+    if reg:
+        props = _vcard_props(reg)
+        if props.get("fn"):
+            w.registrar = _flat(props["fn"][0][1])
+        for pid in reg.get("publicIds") or []:
+            if "iana" in (pid.get("type") or "").lower():
+                w.registrar_iana_id = pid.get("identifier")
+        # rel="about" is the human registrar site; "self" is the RDAP API URL — skip it.
+        for ln in reg.get("links") or []:
+            if (ln.get("rel") or "") == "about" and ln.get("href"):
+                w.registrar_url = ln["href"]
+                break
+
+    registrant = _entity_by_role(entities, "registrant")
+    if registrant:
+        props = _vcard_props(registrant)
+        if props.get("org"):
+            w.registrant_organization = _redact_norm(_flat(props["org"][0][1]))
+        if props.get("adr"):
+            params, val = props["adr"][0]
+            if isinstance(val, list) and len(val) >= 7:
+                # jCard adr: [pobox, ext, street, locality, region, code, country]
+                w.registrant_street = _redact_norm(_flat(val[2]))
+                w.registrant_city = _redact_norm(_flat(val[3]))
+                w.registrant_state = _redact_norm(_flat(val[4]))
+                w.registrant_postal_code = _redact_norm(_flat(val[5]))
+                w.registrant_country = _redact_norm(_flat(val[6]))
+            elif (params or {}).get("label"):
+                w.registrant_street = _redact_norm((params["label"]).replace("\n", ", "))
+        if not w.registrant_country and props.get("country-name"):
+            w.registrant_country = _redact_norm(_flat(props["country-name"][0][1]))
+    return w
+
+
+def domain_rdap(domain: str) -> Optional[DomainWhois]:
+    """Query the authoritative registry RDAP for the TLD. None => no RDAP path."""
+    boot = rdap_bootstrap()
+    tld = domain.rsplit(".", 1)[-1]
+    base = boot.get(tld)
+    if not base:
+        return None
+    try:
+        r = SESSION.get(f"{base}/domain/{domain}", timeout=HTTP_TIMEOUT,
+                        headers={"Accept": "application/rdap+json"})
+        if r.status_code == 404:
+            return DomainWhois(domain_name=domain, source="rdap", error="not registered / not in registry RDAP")
+        if not r.ok:
+            return None
+        return _rdap_parse(r.json(), domain)
+    except Exception:
+        return None
+
+
+# --- port-43 WHOIS path (IANA referral -> registry -> registrar) ------------ #
+def _whois_query(server: str, query: str, timeout: float = 8.0) -> str:
+    with closing(socket.create_connection((server, 43), timeout=timeout)) as s:
+        s.settimeout(timeout)
+        s.sendall((query + "\r\n").encode("idna", "ignore") if not query.isascii()
+                  else (query + "\r\n").encode())
+        chunks: list[bytes] = []
+        while True:
+            try:
+                data = s.recv(4096)
+            except socket.timeout:
+                break
+            if not data:
+                break
+            chunks.append(data)
+    return b"".join(chunks).decode("utf-8", "replace")
+
+
+def _whois43_parse(text: str, domain: str) -> DomainWhois:
+    w = DomainWhois(source="whois43")
+    fields: dict[str, str] = {}
+    ns: list[str] = []
+    status: list[str] = []
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        k, _, v = line.partition(":")
+        k, v = k.strip().lower(), v.strip()
+        if not v:
+            continue
+        if k == "name server":
+            ns.append(v.lower())
+        elif k in ("domain status", "status"):
+            status.append(v)
+        else:
+            fields.setdefault(k, v)  # first occurrence wins (registry over noise)
+
+    def g(*keys: str) -> Optional[str]:
+        return next((fields[k] for k in keys if k in fields), None)
+
+    w.domain_name = (g("domain name") or domain).lower()
+    w.registry_domain_id = g("registry domain id")
+    w.registrar_whois_server = g("registrar whois server")
+    w.registrar_url = g("registrar url")
+    w.updated_date = g("updated date")
+    w.creation_date = g("creation date", "created", "created on")
+    w.expiration_date = g("registry expiry date", "registrar registration expiration date",
+                          "expiration date", "expiry date")
+    w.registrar = g("registrar")
+    w.registrar_iana_id = g("registrar iana id")
+    w.registrant_organization = _redact_norm(g("registrant organization", "registrant org"))
+    w.registrant_street = _redact_norm(g("registrant street", "registrant street1"))
+    w.registrant_city = _redact_norm(g("registrant city"))
+    w.registrant_state = _redact_norm(g("registrant state/province", "registrant state"))
+    w.registrant_postal_code = _redact_norm(g("registrant postal code"))
+    w.registrant_country = _redact_norm(g("registrant country"))
+    w.name_servers = sorted(set(ns))
+    w.domain_status = status
+    return w
+
+
+def whois43(domain: str) -> DomainWhois:
+    # 1. IANA tells us the registry whois server for this TLD.
+    server = None
+    try:
+        iana = _whois_query("whois.iana.org", domain)
+        m = re.search(r"(?im)^refer:\s*(\S+)", iana)
+        if m:
+            server = m.group(1).strip()
+    except Exception:
+        pass
+    if not server:
+        return DomainWhois(domain_name=domain, source="whois43",
+                           error="IANA returned no WHOIS referral for this TLD")
+    # 2. Query the registry.
+    try:
+        text = _whois_query(server, domain)
+    except Exception as e:
+        return DomainWhois(domain_name=domain, source="whois43", error=f"registry WHOIS failed: {e}")
+    # 3. Thin registries (.com/.net) only hold the registrar pointer — follow it.
+    m = re.search(r"(?im)^Registrar WHOIS Server:\s*(\S+)", text)
+    if m:
+        rserver = m.group(1).strip().rstrip(".")
+        if rserver and rserver.lower() != server.lower():
+            try:
+                richer = _whois_query(rserver, domain)
+                if richer and re.search(r"(?im)^Domain Name:", richer):
+                    text = richer
+            except Exception:
+                pass
+    return _whois43_parse(text, domain)
+
+
+def domain_whois(domain: str) -> DomainWhois:
+    """RDAP first (structured), port-43 fallback when RDAP is absent or thin."""
+    w = None
+    try:
+        w = domain_rdap(domain)
+    except Exception:
+        w = None
+    rdap_thin = w is None or not (w.creation_date or w.registrar or w.name_servers)
+    if rdap_thin:
+        try:
+            w43 = whois43(domain)
+        except Exception as e:
+            w43 = DomainWhois(domain_name=domain, error=f"WHOIS fallback failed: {e}")
+        if w is None:
+            return w43
+        # Keep whichever actually carries registration signal.
+        if w43.creation_date or w43.registrar:
+            return w43
+    return w if w is not None else DomainWhois(domain_name=domain, error="no RDAP or WHOIS data")
 
 
 # --------------------------------------------------------------------------- #
@@ -507,10 +852,16 @@ def scan_domain(domain: str) -> ScanDetail:
     for ans in safe_resolve(d, "SOA")[:1]:
         records.append(Record(id=rid, type="SOA", name=d, value=str(ans))); rid += 1
 
-    # Enrich every live/observed IP concurrently (network-bound work).
+    # Enrich every live/observed IP concurrently (network-bound work). Run the
+    # apex WHOIS lookup in the same pool so it costs no extra wall-clock.
     ip_items = sorted(ip_sources.items())
-    with ThreadPoolExecutor(max_workers=10) as ex:
+    with ThreadPoolExecutor(max_workers=11) as ex:
+        whois_future = ex.submit(domain_whois, d)
         ips = list(ex.map(lambda kv: enrich_ip(kv[0], kv[1], hr), ip_items))
+        try:
+            whois = whois_future.result(timeout=30)
+        except Exception:
+            whois = None
 
     # Edge verdict from the apex IP(s).
     edge_masked = "unknown"
@@ -572,6 +923,7 @@ def scan_domain(domain: str) -> ScanDetail:
         domain=d, status="completed", created_at=created, completed_at=completed,
         edge_masked=edge_masked, edge_org=edge_org,
         verdict=verdict, verdict_reasons=reasons,
+        whois=whois,
         records=records, subdomains=subdomains, ips=ips,
         origin_candidates=origin_candidates, notes=notes,
     )
